@@ -1,0 +1,88 @@
+{
+  "builder_name": "competition_dataset",
+  "citation": "",
+  "config_name": "competition_dataset",
+  "dataset_size": 27240526,
+  "description": "Custom VQA dataset for competition evaluation",
+  "download_size": 8070116310,
+  "features": {
+    "image_id": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "question_id": {
+      "dtype": "int32",
+      "_type": "Value"
+    },
+    "question": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "question_tokens": {
+      "feature": {
+        "dtype": "string",
+        "_type": "Value"
+      },
+      "_type": "Sequence"
+    },
+    "image": {
+      "_type": "Image"
+    },
+    "image_width": {
+      "dtype": "int32",
+      "_type": "Value"
+    },
+    "image_height": {
+      "dtype": "int32",
+      "_type": "Value"
+    },
+    "flickr_original_url": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "flickr_300k_url": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "image_classes": {
+      "feature": {
+        "dtype": "string",
+        "_type": "Value"
+      },
+      "_type": "Sequence"
+    },
+    "set_name": {
+      "dtype": "string",
+      "_type": "Value"
+    }
+  },
+  "homepage": "",
+  "license": "",
+  "size_in_bytes": 8097356836,
+  "splits": {
+    "train": {
+      "name": "train",
+      "num_bytes": 21195322,
+      "num_examples": 34602,
+      "dataset_name": "competition_dataset"
+    },
+    "validation": {
+      "name": "validation",
+      "num_bytes": 3050979,
+      "num_examples": 5000,
+      "dataset_name": "competition_dataset"
+    },
+    "test": {
+      "name": "test",
+      "num_bytes": 2994225,
+      "num_examples": 5734,
+      "dataset_name": "competition_dataset"
+    }
+  },
+  "version": {
+    "version_str": "0.5.1",
+    "major": 0,
+    "minor": 5,
+    "patch": 1
+  }
+}
