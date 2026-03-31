@@ -1,5 +1,12 @@
 """
-AICAS 2026 - Qwen3-VL 优化实现
+AICAS 2026 - Participant Core Modification File
+
+Participants should modify the VLMModel class to implement optimizations.
+
+Note:
+- Benchmark directly calls self.model.generate() for performance testing.
+- Your optimizations should modify self.model or its operators in __init__ via Monkey Patch.
+- The generate() method is optional and mainly for debugging.
 """
 from typing import Dict
 try:
@@ -8,42 +15,76 @@ except ImportError:
     class Image:
         pass
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from transformers import AutoModelForImageTextToText, AutoProcessor
+from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
 
 
 class VLMModel:
-    """优化后的 VLMModel"""
+    """
+    Participant optimization class - modify this to implement optimizations.
 
-    def __init__(self, model_path: str, device: str = "cuda:0"):
+    Optimization Architecture:
+    - Split optimizations into separate methods for isolation and testing
+    - Enable/disable each optimization independently in __init__
+    - Each optimization method can be tested individually
+
+    Important Notes:
+    1. Benchmark directly calls self.model.generate() for performance testing.
+    2. Your optimizations should modify self.model or its operators via Monkey Patch.
+    3. All optimizations are applied in __init__ by calling optimization methods.
+    """
+
+    def __init__(self, model_path: str, device: str = "cuda:0", use_quantization: bool = False):
+        """
+        Initialize model and apply optimizations.
+
+        Args:
+            model_path: Qwen3-VL-2B-Instruct model path
+            device: CUDA device, e.g., "cuda:0"
+            use_quantization: 是否使用INT8量化
+        """
         self._device = device
         self.model_path = model_path
+        self._use_quantization = use_quantization
 
         print(f"[VLMModel] Loading processor from {model_path}...")
         self._processor = AutoProcessor.from_pretrained(model_path)
 
-        print(f"[VLMModel] Loading model with FP16...")
-        self._model = AutoModelForImageTextToText.from_pretrained(
-            model_path,
-            torch_dtype=torch.float16,
-            device_map=device,
-            low_cpu_mem_usage=True
-        )
+        if use_quantization:
+            print(f"[VLMModel] Loading model with INT8 quantization...")
+            quantization_config = BitsAndBytesConfig(
+                load_in_8bit=True,
+                llm_int8_threshold=6.0,
+                llm_int8_has_fp16_weight=False,
+            )
+            self._model = AutoModelForImageTextToText.from_pretrained(
+                model_path,
+                quantization_config=quantization_config,
+                device_map=device,
+                low_cpu_mem_usage=True
+            )
+        else:
+            print(f"[VLMModel] Loading model with FP16...")
+            self._model = AutoModelForImageTextToText.from_pretrained(
+                model_path,
+                torch_dtype=torch.float16,
+                device_map=device,
+                low_cpu_mem_usage=True
+            )
         self._model.eval()
 
         self._optimizations_applied = []
 
-        # ========== 应用优化 ==========
+        # ================================================================
+        # Participant Optimization Area - Enable/disable optimization methods
+        # ================================================================
+
         self._enable_torch_compile()
         self._enable_sdpa_attention()
         self._optimize_generation_config()
         self._enable_tensor_float32()
-        self._optimize_vision_encoder()
-        self._optimize_kv_cache()
-        self._optimize_cross_modal_connector()
-        self._enable_flash_attention()
-        # =================================
+        
+        if use_quantization:
+            self._optimizations_applied.append('int8_quantization')
 
         print(f"[VLMModel] Model loaded successfully on {device}")
         if self._optimizations_applied:
@@ -69,18 +110,18 @@ class VLMModel:
         print(f"[VLMModel] Enabling SDPA attention...")
 
         if hasattr(self._model, 'model'):
-            lm = None
             if hasattr(self._model.model, 'language_model'):
                 lm = self._model.model.language_model
+                if hasattr(lm, 'layers'):
+                    for layer in lm.layers:
+                        if hasattr(layer, 'self_attn'):
+                            layer.self_attn._attn = torch.nn.functional.scaled_dot_product_attention
+                            layer.self_attn.use_flash_attn_2 = False
+                            layer.self_attn.use_mem_efficient_attn = True
             elif hasattr(self._model.model, 'layers'):
-                lm = self._model.model
-
-            if lm and hasattr(lm, 'layers'):
-                for layer in lm.layers:
+                for layer in self._model.model.layers:
                     if hasattr(layer, 'self_attn'):
-                        layer.self_attn._attn = F.scaled_dot_product_attention
-                        layer.self_attn.use_flash_attn_2 = False
-                        layer.self_attn.use_mem_efficient_attn = True
+                        layer.self_attn._attn = torch.nn.functional.scaled_dot_product_attention
 
         if 'sdpa_attention' not in self._optimizations_applied:
             self._optimizations_applied.append('sdpa_attention')
@@ -92,6 +133,7 @@ class VLMModel:
 
         if hasattr(self._model, 'generation_config'):
             self._model.generation_config.use_cache = True
+            self._model.generation_config.cache_implementation = "static"
 
         if 'generation_config' not in self._optimizations_applied:
             self._optimizations_applied.append('generation_config')
@@ -106,100 +148,135 @@ class VLMModel:
             self._optimizations_applied.append('tensor_float32')
         print(f"[VLMModel] TensorFloat32 enabled")
 
+    def _explore_model_structure(self):
+        """Helper method to explore model structure."""
+        print("=" * 60)
+        print("Model Structure Exploration")
+        print("=" * 60)
+
+        if hasattr(self._model, 'visual'):
+            print(f"Visual Model: {type(self._model.visual)}")
+        elif hasattr(self._model, 'model') and hasattr(self._model.model, 'visual'):
+            print(f"Visual Model: {type(self._model.model.visual)}")
+
+        if hasattr(self._model, 'model'):
+            print(f"Model: {type(self._model.model)}")
+
+        print("=" * 60)
+
     def _optimize_vision_encoder(self):
-        """优化视觉编码器 - 按照README示例替换attention算子"""
+        """优化视觉编码器
+        
+        优化方向:
+        1. 启用Flash Attention for Vision
+        2. 优化Patch Embedding
+        """
         print(f"[VLMModel] Optimizing vision encoder...")
-
-        # 正确的路径: model.model.visual
+        
+        visual = None
         if hasattr(self._model, 'model') and hasattr(self._model.model, 'visual'):
-            vision_model = self._model.model.visual
-
-            if hasattr(vision_model, 'blocks'):
-                for i, block in enumerate(vision_model.blocks):
+            visual = self._model.model.visual
+        elif hasattr(self._model, 'visual'):
+            visual = self._model.visual
+        
+        if visual is not None:
+            torch.backends.cuda.enable_flash_sdp(True)
+            
+            if hasattr(visual, 'blocks'):
+                for block in visual.blocks:
                     if hasattr(block, 'attn'):
-                        original_attn_forward = block.attn.forward
-
-                        def make_optimized_attn(orig_forward):
-                            def optimized_attn(hidden_states, *args, **kwargs):
-                                return orig_forward(hidden_states, *args, **kwargs)
-                            return optimized_attn
-
-                        block.attn.forward = make_optimized_attn(original_attn_forward)
-                        print(f"[VLMModel] Block {i} attn patched")
-
-            if hasattr(vision_model, 'patch_embed'):
-                original_patch_embed = vision_model.patch_embed.forward
-
-                def patched_patch_embed(x):
-                    return original_patch_embed(x)
-
-                vision_model.patch_embed.forward = patched_patch_embed
-                print(f"[VLMModel] patch_embed patched")
-
+                        if hasattr(block.attn, '_attn_implementation'):
+                            block.attn._attn_implementation = "flash_attention_2"
+        
         if 'vision_encoder' not in self._optimizations_applied:
             self._optimizations_applied.append('vision_encoder')
-        print(f"[VLMModel] Vision encoder optimization applied")
+        print(f"[VLMModel] Vision encoder optimized")
 
     def _optimize_kv_cache(self):
-        """优化KV Cache - 按照README设置use_cache"""
+        """优化KV Cache
+        
+        优化方向:
+        1. Memory layout optimization
+        2. Fragmentation-free allocation
+        3. Efficient cache reuse
+        """
         print(f"[VLMModel] Optimizing KV cache...")
-
-        if hasattr(self._model, 'config'):
-            self._model.config.use_cache = True
-            if hasattr(self._model.config, 'pad_token_id'):
-                if self._model.config.pad_token_id is None:
-                    self._model.config.pad_token_id = self._model.config.eos_token_id
-
-        if hasattr(self._model, 'model') and hasattr(self._model.model, 'language_model'):
-            lm = self._model.model.language_model
-            if hasattr(lm, 'layers'):
-                for layer in lm.layers:
-                    if hasattr(layer, 'self_attn'):
-                        layer.self_attn.past_key_value = None
-
+        
+        self._model.config.use_cache = True
+        
         if 'kv_cache' not in self._optimizations_applied:
             self._optimizations_applied.append('kv_cache')
-        print(f"[VLMModel] KV cache optimization applied")
+        print(f"[VLMModel] KV cache optimized")
 
     def _optimize_cross_modal_connector(self):
-        """优化跨模态连接器"""
+        """优化跨模态连接器
+        
+        优化方向:
+        1. MLP层融合
+        2. Vision-to-language投影优化
+        """
         print(f"[VLMModel] Optimizing cross-modal connector...")
-
-        if hasattr(self._model, 'model') and hasattr(self._model.model, 'connector'):
-            connector = self._model.model.connector
-
-            for name, module in connector.named_modules():
-                if isinstance(module, nn.Linear):
-                    module.float()
-                    for param in module.parameters():
-                        param.data = param.data.contiguous()
-
-            print(f"[VLMModel] Connector modules optimized")
-
-        if 'cross_modal_connector' not in self._optimizations_applied:
-            self._optimizations_applied.append('cross_modal_connector')
-        print(f"[VLMModel] Cross-modal connector optimization applied")
+        
+        visual = None
+        if hasattr(self._model, 'model') and hasattr(self._model.model, 'visual'):
+            visual = self._model.model.visual
+        elif hasattr(self._model, 'visual'):
+            visual = self._model.visual
+        
+        if visual is not None:
+            if hasattr(visual, 'merger'):
+                visual.merger = torch.compile(
+                    visual.merger,
+                    mode="reduce-overhead",
+                    fullgraph=False
+                )
+            
+            if hasattr(visual, 'deepstack_merger_list'):
+                for i, merger in enumerate(visual.deepstack_merger_list):
+                    visual.deepstack_merger_list[i] = torch.compile(
+                        merger,
+                        mode="reduce-overhead",
+                        fullgraph=False
+                    )
+        
+        if 'cross_modal' not in self._optimizations_applied:
+            self._optimizations_applied.append('cross_modal')
+        print(f"[VLMModel] Cross-modal connector optimized")
 
     def _enable_flash_attention(self):
-        """启用Flash Attention - 按照README使用PyTorch backend"""
+        """启用Flash Attention
+        
+        方法1: 启用PyTorch内置Flash Attention (简单)
+        方法2: 自定义Triton Kernel (高级)
+        """
         print(f"[VLMModel] Enabling Flash Attention...")
-
-        import torch.backends.cuda as cuda_backends
-        cuda_backends.enable_flash_sdp(True)
-        cuda_backends.enable_mem_efficient_sdp(True)
-        cuda_backends.enable_math_sdp(False)
-
-        if hasattr(self._model, 'model') and hasattr(self._model.model, 'language_model'):
-            lm = self._model.model.language_model
-            if hasattr(lm, 'layers'):
-                for layer in lm.layers:
-                    if hasattr(layer, 'self_attn'):
-                        if hasattr(layer.self_attn, 'set_flash_attention'):
-                            layer.self_attn.set_flash_attention(True)
-
+        
+        torch.backends.cuda.enable_flash_sdp(True)
+        torch.backends.cuda.enable_mem_efficient_sdp(True)
+        torch.backends.cuda.enable_math_sdp(False)
+        
         if 'flash_attention' not in self._optimizations_applied:
             self._optimizations_applied.append('flash_attention')
         print(f"[VLMModel] Flash Attention enabled")
+
+    def _apply_quantization(self):
+        """应用量化优化
+        
+        优化方向:
+        1. INT8动态量化
+        2. FP8量化 (需要硬件支持)
+        3. KV Cache量化
+        
+        注意: 
+        - 量化在RTX 3090上会降低性能（INT8矩阵乘法不如FP16）
+        - 量化主要用于减少显存占用，而非提升速度
+        - 如需使用，请在模型加载时设置use_quantization=True
+        """
+        print(f"[VLMModel] Quantization skipped - FP16 is optimal for RTX 3090")
+        print(f"[VLMModel] Use use_quantization=True at init for INT8 (reduces VRAM, slower)")
+        
+        if 'quantization' not in self._optimizations_applied:
+            self._optimizations_applied.append('quantization_skipped')
 
     @property
     def processor(self):
