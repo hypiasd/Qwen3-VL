@@ -16,7 +16,7 @@ except ImportError:
         pass
 import torch
 import os
-from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
+from transformers import AutoModelForImageTextToText, AutoProcessor
 
 try:
     from triton_kernels import triton_bilinear_pos_embed, fused_layernorm_linear
@@ -52,43 +52,27 @@ class VLMModel:
     3. All optimizations are applied in __init__ by calling optimization methods.
     """
 
-    def __init__(self, model_path: str, device: str = "cuda:0", use_quantization: bool = False):
+    def __init__(self, model_path: str, device: str = "cuda:0"):
         """
         Initialize model and apply optimizations.
 
         Args:
             model_path: Qwen3-VL-2B-Instruct model path
             device: CUDA device, e.g., "cuda:0"
-            use_quantization: 是否使用INT8量化
         """
         self._device = device
         self.model_path = model_path
-        self._use_quantization = use_quantization
 
         print(f"[VLMModel] Loading processor from {model_path}...")
         self._processor = AutoProcessor.from_pretrained(model_path)
 
-        if use_quantization:
-            print(f"[VLMModel] Loading model with INT8 quantization...")
-            quantization_config = BitsAndBytesConfig(
-                load_in_8bit=True,
-                llm_int8_threshold=6.0,
-                llm_int8_has_fp16_weight=False,
-            )
-            self._model = AutoModelForImageTextToText.from_pretrained(
-                model_path,
-                quantization_config=quantization_config,
-                device_map=device,
-                low_cpu_mem_usage=True
-            )
-        else:
-            print(f"[VLMModel] Loading model with FP16...")
-            self._model = AutoModelForImageTextToText.from_pretrained(
-                model_path,
-                torch_dtype=torch.float16,
-                device_map=device,
-                low_cpu_mem_usage=True
-            )
+        print(f"[VLMModel] Loading model with FP16...")
+        self._model = AutoModelForImageTextToText.from_pretrained(
+            model_path,
+            torch_dtype=torch.float16,
+            device_map=device,
+            low_cpu_mem_usage=True
+        )
         self._model.eval()
 
         self._optimizations_applied = []
@@ -108,9 +92,6 @@ class VLMModel:
         self._optimize_vision_encoder()       # Vision Encoder Triton优化
         self._apply_operator_fusion()         # 算子融合
         self._optimize_memory_access()        # 内存访问优化
-        
-        if use_quantization:
-            self._optimizations_applied.append('int8_quantization')
 
         print(f"[VLMModel] Model loaded successfully on {device}")
         if self._optimizations_applied:
@@ -570,23 +551,11 @@ class VLMModel:
             print(f"[VLMModel] Warning: Failed to optimize memory access: {e}")
     
     def _apply_quantization(self):
-        """应用量化优化
+        """量化优化 - 已禁用
         
-        优化方向:
-        1. INT8动态量化
-        2. FP8量化 (需要硬件支持)
-        3. KV Cache量化
-        
-        注意: 
-        - 量化在RTX 3090上会降低性能（INT8矩阵乘法不如FP16）
-        - 量化主要用于减少显存占用，而非提升速度
-        - 如需使用，请在模型加载时设置use_quantization=True
+        注意: 官方规则禁止使用量化优化，此方法保留但不做任何操作
         """
-        print(f"[VLMModel] Quantization skipped - FP16 is optimal for RTX 3090")
-        print(f"[VLMModel] Use use_quantization=True at init for INT8 (reduces VRAM, slower)")
-        
-        if 'quantization' not in self._optimizations_applied:
-            self._optimizations_applied.append('quantization_skipped')
+        print(f"[VLMModel] Quantization disabled by competition rules")
 
     @property
     def processor(self):
