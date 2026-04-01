@@ -16,16 +16,17 @@ tqdm>=4.65.0
 # 系统信息（可选，用于获取详细的硬件信息）
 psutil>=5.9.0
 
-# 可选：Triton 算子开发
+# 可选：Triton 算子开发（用于自定义kernel优化）
+# 如果可用，将自动使用Triton加速，否则回退到PyTorch实现
 triton>=2.1.0
 
-# 可选：Flash Attention（需要 CUDA 编译）
-# flash-attn>=2.0.0
+# 可选：Flash Attention 2（需要 CUDA 11.8+ 和 Ampere+ GPU）
+# 如果可用，将自动使用Flash Attention 2，否则回退到PyTorch SDPA
+# 注意：此包需要编译，安装时间较长
+# flash-attn>=2.5.0
 
-# 可选：量化工具
-# bitsandbytes>=0.41.0
-# auto-gptq>=0.5.0
-
-# 可选：Profiling
-# tensorboard>=2.14.0
-
+# 注意事项：
+# 1. triton 和 flash-attn 都是可选依赖
+# 2. 如果这些库不可用，代码会自动回退到PyTorch原生实现
+# 3. flash-attn 需要 CUDA 11.8+ 和 Ampere架构以上的GPU (A100, A800, RTX 3090/4090等)
+# 4. 在评测环境（A800 80GB, CUDA 12.8）中，这些库应该都能正常工作
