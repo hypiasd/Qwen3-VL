@@ -597,12 +597,10 @@ class VLMModel:
                 self_mlp._aicas_gate_up_weight,
                 None,
             )
-            gate, up = torch.split(
-                gate_up,
-                [self_mlp._aicas_gate_out, self_mlp._aicas_up_out],
-                dim=-1,
-            )
-            return self_mlp.down_proj(self_mlp.act_fn(gate) * up)
+            # triton_silu_mul handles splitting, silu, and multiplication
+            from triton_kernels import triton_silu_mul
+            act_out = triton_silu_mul(gate_up)
+            return self_mlp.down_proj(act_out)
 
         if hasattr(model_obj, 'model') and hasattr(model_obj.model, 'language_model'):
             lm = model_obj.model.language_model
@@ -906,7 +904,7 @@ class VLMModel:
                     for _ in range(3):
                         self._model(**decode_kwargs)
                         
-                    # Capture Graph 1
+                    # Capture Single Token Decode Graph
                     self._model._aicas_g = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(self._model._aicas_g):
                         self._model._aicas_decode_out = self._model(**decode_kwargs)
@@ -969,31 +967,29 @@ class VLMModel:
                 seq_len = all_ids.shape[1]
                 
                 while step < max_new_tokens - 1:
-                    # Optimize ngram search:
-                    # Look for the last 3 tokens in the previous context
-                    ngram_size = 3
+                    # Optimize ngram search with multiple sizes (5, 4, 3, 2)
                     num_candidates = self._K
-                    
                     found_candidates = 0
-                    if seq_len > ngram_size:
-                        target = seq_buffer[0, seq_len-ngram_size:seq_len]
-                        # Don't slice out the end of search_space, let unfold run over everything
-                        # Just ensure we don't match the target itself at the very end
-                        search_space = seq_buffer[0, :seq_len-1]
-                        
-                        unfolded = search_space.unfold(0, ngram_size, 1)
-                        matches = (unfolded == target).all(dim=-1)
-                        
-                        # Find the last match
-                        match_indices = matches.nonzero()
-                        if match_indices.numel() > 0:
-                            last_match_idx = match_indices[-1, 0].item()
-                            # Ensure we don't pick a match that's too close to the end (overlapping)
-                            if last_match_idx <= seq_len - ngram_size - 1:
-                                start_idx = last_match_idx + ngram_size
-                                end_idx = min(start_idx + num_candidates, seq_len)
-                                candidates = seq_buffer[0, start_idx:end_idx]
-                                found_candidates = candidates.shape[0]
+                    candidates = None
+                    
+                    for ngram_size in [5, 4, 3, 2]:
+                        if seq_len > ngram_size:
+                            target = seq_buffer[0, seq_len-ngram_size:seq_len]
+                            search_space = seq_buffer[0, :seq_len-1]
+                            
+                            unfolded = search_space.unfold(0, ngram_size, 1)
+                            matches = (unfolded == target).all(dim=-1)
+                            match_indices = matches.nonzero()
+                            
+                            if match_indices.numel() > 0:
+                                last_match_idx = match_indices[-1, 0].item()
+                                if last_match_idx <= seq_len - ngram_size - 1:
+                                    start_idx = last_match_idx + ngram_size
+                                    end_idx = min(start_idx + num_candidates, seq_len)
+                                    candidates = seq_buffer[0, start_idx:end_idx]
+                                    found_candidates = candidates.shape[0]
+                                    break
+
                     
                     if found_candidates > 0:
                         L = self._K + 1

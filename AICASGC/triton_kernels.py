@@ -439,12 +439,14 @@ if HAS_TRITON and HAS_TRITON_OP:
         return out
 
 
+
 __all__ = [
     'triton_bilinear_pos_embed',
     'fused_layernorm_linear',
     'triton_static_cache_update',
     'triton_elementwise_mul',
-    'HAS_TRITON'
+    'HAS_TRITON',
+    'triton_silu_mul',
 ]
 
 if HAS_TRITON:
@@ -792,3 +794,49 @@ if HAS_TRITON:
         )
         
         return out.view(orig_shape)
+
+if HAS_TRITON:
+    @triton.jit
+    def _silu_mul_kernel(
+        gate_up_ptr,
+        out_ptr,
+        n_elements,
+        intermediate_size,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        
+        row = offsets // intermediate_size
+        col = offsets % intermediate_size
+        
+        gate_idx = row * (2 * intermediate_size) + col
+        up_idx = gate_idx + intermediate_size
+        
+        gate = tl.load(gate_up_ptr + gate_idx, mask=mask)
+        up = tl.load(gate_up_ptr + up_idx, mask=mask)
+        
+        gate_f32 = gate.to(tl.float32)
+        silu_gate = gate_f32 * tl.sigmoid(gate_f32)
+        res = (silu_gate.to(gate.dtype)) * up
+        
+        tl.store(out_ptr + offsets, res, mask=mask)
+
+    def triton_silu_mul(gate_up: torch.Tensor) -> torch.Tensor:
+        shape = gate_up.shape
+        intermediate_size = shape[-1] // 2
+        out_shape = list(shape)
+        out_shape[-1] = intermediate_size
+        out = torch.empty(out_shape, device=gate_up.device, dtype=gate_up.dtype)
+        n_elements = out.numel()
+        grid = lambda meta: (triton.cdiv(n_elements, meta['BLOCK_SIZE']),)
+        _silu_mul_kernel[grid](gate_up, out, n_elements, intermediate_size, BLOCK_SIZE=1024)
+        return out
+else:
+    def triton_silu_mul(gate_up: torch.Tensor) -> torch.Tensor:
+        shape = gate_up.shape
+        intermediate_size = shape[-1] // 2
+        gate, up = torch.split(gate_up, intermediate_size, dim=-1)
+        return torch.nn.functional.silu(gate) * up
