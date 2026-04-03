@@ -1,7 +1,15 @@
 """
 Triton Kernels for VLM Optimization
 
-This module provides optimized Triton kernels for vision encoder operations.
+This module contains the hand-written kernels used by the manual-only profiles.
+
+Stage mapping:
+- Vision prefill: `triton_bilinear_pos_embed`, `triton_vision_qkv_rope_transpose`,
+  `triton_layernorm`, `triton_gelu_tanh`
+- Language prefill/decode: `triton_fused_rmsnorm_rope`, `triton_rmsnorm`
+- Candidate-only kernels not wired into the main path yet:
+  `fused_layernorm_linear`, `triton_static_cache_update`, `triton_elementwise_mul`
+
 All kernels have PyTorch fallback implementations for environments without Triton.
 """
 import torch
@@ -232,6 +240,7 @@ def _pytorch_bilinear_pos_embed(pos_embed: torch.Tensor, H_new: int, W_new: int)
 
 
 def triton_bilinear_pos_embed(pos_embed: torch.Tensor, H_new: int, W_new: int) -> torch.Tensor:
+    # Vision-prefill helper used by the visual position embedding fast path.
     """
     Bilinear position embedding interpolation.
     
@@ -319,6 +328,7 @@ def fused_layernorm_linear(
     bias: torch.Tensor,
     eps: float = 1e-5
 ) -> torch.Tensor:
+    # Candidate kernel for language-side hot paths. Not yet wired into evaluation_wrapper.py.
     """
     Fused LayerNorm + Linear operation.
     
@@ -367,6 +377,7 @@ def triton_static_cache_update(
     states: torch.Tensor,
     position: int
 ) -> torch.Tensor:
+    # Candidate handwritten KV update path. Not used by the current manual profiles.
     if HAS_TRITON_OP and hasattr(torch.ops, "aicas_ops") and hasattr(torch.ops.aicas_ops, "static_cache_update"):
         torch.ops.aicas_ops.static_cache_update(cache, states, position)
         return cache
@@ -391,6 +402,7 @@ def _triton_elementwise_mul_impl(x: torch.Tensor, y: torch.Tensor) -> torch.Tens
 
 
 def triton_elementwise_mul(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    # Candidate elementwise helper. Keep out of the main path until profiling shows a need.
     if HAS_TRITON_OP and hasattr(torch.ops, "aicas_ops") and hasattr(torch.ops.aicas_ops, "elementwise_mul"):
         return torch.ops.aicas_ops.elementwise_mul(x, y)
     if HAS_TRITON:
@@ -461,7 +473,7 @@ if HAS_TRITON:
         var = tl.sum(x * x, axis=0) / D
         rsqrt = tl.math.rsqrt(var + eps)
         
-        w = tl.load(weight_ptr + offs_d, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(weight_ptr + offs_d, mask=mask, other=0.0, eviction_policy='evict_last').to(tl.float32)
         x_norm = x * rsqrt * w
         
         cos_ptrs = cos_ptr + pid_b * stride_cos_b + pid_l * stride_cos_l + offs_d * stride_cos_d
@@ -494,6 +506,7 @@ if HAS_TRITON and HAS_TRITON_OP:
         sin: torch.Tensor, 
         eps: float
     ) -> torch.Tensor:
+        # Main language-model kernel for the decode-heavy path.
         B, L, H, D = x.shape
         out = torch.empty((B, H, L, D), dtype=x.dtype, device=x.device)
         BLOCK_D = triton.next_power_of_2(D)
@@ -525,7 +538,7 @@ if HAS_TRITON:
         var = tl.sum(x * x, axis=0) / N
         rsqrt = tl.math.rsqrt(var + eps)
         
-        w = tl.load(weight_ptr + tl.arange(0, BLOCK_N), mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(weight_ptr + tl.arange(0, BLOCK_N), mask=mask, other=0.0, eviction_policy='evict_last').to(tl.float32)
         out = x * rsqrt * w
         
         out_ptrs = out_ptr + row_idx * stride_out_row + tl.arange(0, BLOCK_N)
@@ -534,6 +547,7 @@ if HAS_TRITON:
 if HAS_TRITON and HAS_TRITON_OP:
     @triton_op("aicas_ops::rmsnorm", mutates_args={})
     def triton_rmsnorm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+        # Main language-model norm replacement used in both prefill and decode.
         x_2d = x.view(-1, x.shape[-1])
         out_2d = torch.empty_like(x_2d)
         N = x.shape[-1]
@@ -604,6 +618,7 @@ if HAS_TRITON:
 if HAS_TRITON and HAS_TRITON_OP:
     @triton_op("aicas_ops::fused_vision_qkv_rope_transpose", mutates_args={})
     def triton_vision_qkv_rope_transpose(qkv: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, H: int, D: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Main vision-prefill fused kernel, not part of the iterative decode loop.
         S = qkv.shape[0]
         q_out = torch.empty((1, H, S, D), dtype=qkv.dtype, device=qkv.device)
         k_out = torch.empty((1, H, S, D), dtype=qkv.dtype, device=qkv.device)
@@ -679,6 +694,7 @@ if HAS_TRITON:
 if HAS_TRITON and HAS_TRITON_OP:
     @triton_op("aicas_ops::layernorm", mutates_args={})
     def triton_layernorm(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, eps: float) -> torch.Tensor:
+        # Vision-prefill LayerNorm replacement.
         x_2d = x.view(-1, x.shape[-1])
         out_2d = torch.empty_like(x_2d)
         N = x.shape[-1]
@@ -697,6 +713,7 @@ if HAS_TRITON and HAS_TRITON_OP:
 
     @triton_op("aicas_ops::gelu_tanh", mutates_args={})
     def triton_gelu_tanh(x: torch.Tensor) -> torch.Tensor:
+        # Vision-prefill activation replacement.
         out = torch.empty_like(x)
         n_elements = x.numel()
         BLOCK_SIZE = 1024
@@ -706,3 +723,72 @@ if HAS_TRITON and HAS_TRITON_OP:
         )
         return out
 
+if HAS_TRITON:
+    @triton.jit
+    def fused_residual_rmsnorm_kernel(
+        X_ptr,          # [M, N] The current hidden states
+        Residual_ptr,   # [M, N] The residual connection
+        NormW_ptr,      # [N] The RMSNorm weights
+        Out_ptr,        # [M, N] The output after RMSNorm
+        ResOut_ptr,     # [M, N] The updated residual (X + Residual)
+        M, N,
+        stride_xm, stride_xn,
+        stride_resm, stride_resn,
+        stride_outm, stride_outn,
+        stride_resoutm, stride_resoutn,
+        EPS: tl.constexpr,
+        BLOCK_N: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        row_idx = pid
+        if row_idx >= M:
+            return
+            
+        X_row_ptr = X_ptr + row_idx * stride_xm
+        Res_row_ptr = Residual_ptr + row_idx * stride_resm
+        Out_row_ptr = Out_ptr + row_idx * stride_outm
+        ResOut_row_ptr = ResOut_ptr + row_idx * stride_resoutm
+        
+        offsets = tl.arange(0, BLOCK_N)
+        mask = offsets < N
+        
+        # evict_first for x since it's only read once and never reused
+        x = tl.load(X_row_ptr + offsets * stride_xn, mask=mask, other=0.0, eviction_policy='evict_first').to(tl.float32)
+        # res is read and written, let's keep it in L2
+        res = tl.load(Res_row_ptr + offsets * stride_resn, mask=mask, other=0.0, eviction_policy='evict_last').to(tl.float32)
+        
+        x_res = x + res
+        
+        variance = tl.sum(x_res * x_res, axis=0) / N
+        rsqrt = tl.math.rsqrt(variance + EPS)
+        
+        # norm_w is read multiple times across rows, keep it in L2
+        norm_w = tl.load(NormW_ptr + offsets, mask=mask, other=0.0, eviction_policy='evict_last').to(tl.float32)
+        out = x_res * rsqrt * norm_w
+        
+        tl.store(ResOut_row_ptr + offsets * stride_resoutn, x_res.to(X_ptr.dtype.element_ty), mask=mask)
+        tl.store(Out_row_ptr + offsets * stride_outn, out.to(X_ptr.dtype.element_ty), mask=mask)
+
+    def triton_fused_residual_rmsnorm(x, residual, norm_weight, eps=1e-6):
+        orig_shape = x.shape
+        x_2d = x.view(-1, orig_shape[-1])
+        res_2d = residual.view(-1, orig_shape[-1])
+        
+        M, N = x_2d.shape
+        out = torch.empty_like(x_2d)
+        BLOCK_N = triton.next_power_of_2(N)
+        
+        grid = (M,)
+        fused_residual_rmsnorm_kernel[grid](
+            x_2d, res_2d, norm_weight, out, res_2d,
+            M, N,
+            x_2d.stride(0), x_2d.stride(1),
+            res_2d.stride(0), res_2d.stride(1),
+            out.stride(0), out.stride(1),
+            res_2d.stride(0), res_2d.stride(1),
+            EPS=eps,
+            BLOCK_N=BLOCK_N,
+            num_warps=4 if BLOCK_N <= 2048 else 8
+        )
+        
+        return out.view(orig_shape)
