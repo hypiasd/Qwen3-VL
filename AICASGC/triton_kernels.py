@@ -470,7 +470,7 @@ if HAS_TRITON:
         mask = offs_d < D
         
         x_ptrs = x_ptr + pid_b * stride_x_b + pid_l * stride_x_l + pid_h * stride_x_h + offs_d * stride_x_d
-        x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(x_ptrs, mask=mask, other=0.0, eviction_policy='evict_first').to(tl.float32)
         
         var = tl.sum(x * x, axis=0) / D
         rsqrt = tl.math.rsqrt(var + eps)
@@ -481,14 +481,14 @@ if HAS_TRITON:
         cos_ptrs = cos_ptr + pid_b * stride_cos_b + pid_l * stride_cos_l + offs_d * stride_cos_d
         sin_ptrs = sin_ptr + pid_b * stride_cos_b + pid_l * stride_cos_l + offs_d * stride_cos_d
         
-        cos = tl.load(cos_ptrs, mask=mask, other=0.0).to(tl.float32)
-        sin = tl.load(sin_ptrs, mask=mask, other=0.0).to(tl.float32)
+        cos = tl.load(cos_ptrs, mask=mask, other=0.0, eviction_policy='evict_last').to(tl.float32)
+        sin = tl.load(sin_ptrs, mask=mask, other=0.0, eviction_policy='evict_last').to(tl.float32)
         
         half_D = D // 2
         rot_offs_d = (offs_d + half_D) % D
         x_rot_ptrs = x_ptr + pid_b * stride_x_b + pid_l * stride_x_l + pid_h * stride_x_h + rot_offs_d * stride_x_d
-        x_rot = tl.load(x_rot_ptrs, mask=mask, other=0.0).to(tl.float32)
-        w_rot = tl.load(weight_ptr + rot_offs_d, mask=mask, other=0.0).to(tl.float32)
+        x_rot = tl.load(x_rot_ptrs, mask=mask, other=0.0, eviction_policy='evict_first').to(tl.float32)
+        w_rot = tl.load(weight_ptr + rot_offs_d, mask=mask, other=0.0, eviction_policy='evict_last').to(tl.float32)
         x_norm_rot = x_rot * rsqrt * w_rot
         
         sign = tl.where(offs_d < half_D, -1.0, 1.0)
@@ -589,12 +589,12 @@ if HAS_TRITON:
         k_offset = pid_s * stride_qkv_s + 1 * (H * D) + pid_h * D + offs_d
         v_offset = pid_s * stride_qkv_s + 2 * (H * D) + pid_h * D + offs_d
 
-        q = tl.load(qkv_ptr + q_offset, mask=mask, other=0.0).to(tl.float32)
-        k = tl.load(qkv_ptr + k_offset, mask=mask, other=0.0).to(tl.float32)
-        v = tl.load(qkv_ptr + v_offset, mask=mask, other=0.0).to(tl.float32)
+        q = tl.load(qkv_ptr + q_offset, mask=mask, other=0.0, eviction_policy='evict_first').to(tl.float32)
+        k = tl.load(qkv_ptr + k_offset, mask=mask, other=0.0, eviction_policy='evict_first').to(tl.float32)
+        v = tl.load(qkv_ptr + v_offset, mask=mask, other=0.0, eviction_policy='evict_first').to(tl.float32)
 
-        cos = tl.load(cos_ptr + pid_s * stride_cos_s + offs_d * stride_cos_d, mask=mask, other=0.0).to(tl.float32)
-        sin = tl.load(sin_ptr + pid_s * stride_cos_s + offs_d * stride_cos_d, mask=mask, other=0.0).to(tl.float32)
+        cos = tl.load(cos_ptr + pid_s * stride_cos_s + offs_d * stride_cos_d, mask=mask, other=0.0, eviction_policy='evict_last').to(tl.float32)
+        sin = tl.load(sin_ptr + pid_s * stride_cos_s + offs_d * stride_cos_d, mask=mask, other=0.0, eviction_policy='evict_last').to(tl.float32)
 
         half_D = D // 2
         rot_offs_d = (offs_d + half_D) % D
@@ -602,8 +602,8 @@ if HAS_TRITON:
         q_rot_offset = pid_s * stride_qkv_s + 0 * (H * D) + pid_h * D + rot_offs_d
         k_rot_offset = pid_s * stride_qkv_s + 1 * (H * D) + pid_h * D + rot_offs_d
 
-        q_rot = tl.load(qkv_ptr + q_rot_offset, mask=mask, other=0.0).to(tl.float32)
-        k_rot = tl.load(qkv_ptr + k_rot_offset, mask=mask, other=0.0).to(tl.float32)
+        q_rot = tl.load(qkv_ptr + q_rot_offset, mask=mask, other=0.0, eviction_policy='evict_first').to(tl.float32)
+        k_rot = tl.load(qkv_ptr + k_rot_offset, mask=mask, other=0.0, eviction_policy='evict_first').to(tl.float32)
 
         sign = tl.where(offs_d < half_D, -1.0, 1.0)
         q_rot = q_rot * sign
@@ -678,7 +678,7 @@ if HAS_TRITON:
         offs = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offs < n_elements
 
-        x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(x_ptr + offs, mask=mask, other=0.0, eviction_policy='evict_first').to(tl.float32)
 
         c1 = 0.7978845608 # sqrt(2/pi)
         c2 = 0.044715
@@ -815,8 +815,8 @@ if HAS_TRITON:
         gate_idx = row * (2 * intermediate_size) + col
         up_idx = gate_idx + intermediate_size
         
-        gate = tl.load(gate_up_ptr + gate_idx, mask=mask)
-        up = tl.load(gate_up_ptr + up_idx, mask=mask)
+        gate = tl.load(gate_up_ptr + gate_idx, mask=mask, eviction_policy='evict_first')
+        up = tl.load(gate_up_ptr + up_idx, mask=mask, eviction_policy='evict_first')
         
         gate_f32 = gate.to(tl.float32)
         silu_gate = gate_f32 * tl.sigmoid(gate_f32)

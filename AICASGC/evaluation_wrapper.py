@@ -67,11 +67,12 @@ class VLMModel:
         print(f"[VLMModel] Loading processor from {model_path}...")
         self._processor = AutoProcessor.from_pretrained(model_path)
 
-        print(f"[VLMModel] Loading model with FP16...")
+        print(f"[VLMModel] Loading model with FP16 and FlashAttention-2...")
         load_kwargs = {
             "torch_dtype": torch.float16,
             "device_map": device,
             "low_cpu_mem_usage": True,
+            "attn_implementation": "flash_attention_2",
         }
         self._optimizations_applied = []
         self._model = AutoModelForImageTextToText.from_pretrained(model_path, **load_kwargs)
@@ -908,30 +909,47 @@ class VLMModel:
                     self._model._aicas_g = torch.cuda.CUDAGraph()
                     with torch.cuda.graph(self._model._aicas_g):
                         self._model._aicas_decode_out = self._model(**decode_kwargs)
+                        # Token update inside the graph
+                        tok = self._model._aicas_decode_out.logits[0, -1].argmax().unsqueeze(0).unsqueeze(0)
+                        self._model._aicas_next_token.copy_(tok)
+                        self._model._aicas_cache_position.add_(1)
+                        self._model._aicas_position_ids.add_(1)
                         
-                    # Setup Speculative Graph (L = 16)
-                    self._K = 15
-                    L = self._K + 1
-                    self._model._aicas_next_token_spec = torch.zeros((1, L), device=self._model.device, dtype=torch.long)
-                    self._model._aicas_arange_L = torch.arange(L, device=self._model.device, dtype=torch.long)
-                    self._model._aicas_cache_position_spec = self._model._aicas_arange_L.clone()
-                    self._model._aicas_position_ids_spec = torch.zeros((3, 1, L), device=self._model.device, dtype=torch.long)
-                    
-                    decode_kwargs_spec = {
-                        "input_ids": self._model._aicas_next_token_spec,
-                        "position_ids": self._model._aicas_position_ids_spec,
-                        "cache_position": self._model._aicas_cache_position_spec,
-                        "past_key_values": self._model._aicas_past_key_values,
-                        "use_cache": True,
-                        "return_dict": True
-                    }
-                    
-                    for _ in range(3):
-                        self._model(**decode_kwargs_spec)
+                    # Setup Speculative Graphs (L = 3, 6, 10)
+                    self._model._aicas_specs = {}
+                    for K in [2, 5, 9]:
+                        L = K + 1
+                        next_token_spec = torch.zeros((1, L), device=self._model.device, dtype=torch.long)
+                        arange_L = torch.arange(L, device=self._model.device, dtype=torch.long)
+                        cache_position_spec = arange_L.clone()
+                        position_ids_spec = torch.zeros((3, 1, L), device=self._model.device, dtype=torch.long)
                         
-                    self._model._aicas_g_spec = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(self._model._aicas_g_spec):
-                        self._model._aicas_decode_out_spec = self._model(**decode_kwargs_spec)
+                        decode_kwargs_spec = {
+                            "input_ids": next_token_spec,
+                            "position_ids": position_ids_spec,
+                            "cache_position": cache_position_spec,
+                            "past_key_values": self._model._aicas_past_key_values,
+                            "use_cache": True,
+                            "return_dict": True
+                        }
+                        
+                        for _ in range(3):
+                            self._model(**decode_kwargs_spec)
+                            
+                        g_spec = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(g_spec):
+                            decode_out_spec = self._model(**decode_kwargs_spec)
+                            
+                        self._model._aicas_specs[K] = {
+                            "g": g_spec,
+                            "next_token": next_token_spec,
+                            "cache_position": cache_position_spec,
+                            "position_ids": position_ids_spec,
+                            "arange": arange_L,
+                            "decode_out": decode_out_spec
+                        }
+                        
+                    self._K_max = 9
                 
                 # Reset cache for the new sequence
                 self._model._aicas_past_key_values.reset()
@@ -967,12 +985,12 @@ class VLMModel:
                 seq_len = all_ids.shape[1]
                 
                 while step < max_new_tokens - 1:
-                    # Optimize ngram search with multiple sizes (5, 4, 3, 2)
-                    num_candidates = self._K
+                    # Optimize ngram search with multiple sizes (4, 3, 2)
+                    num_candidates = self._K_max
                     found_candidates = 0
                     candidates = None
                     
-                    for ngram_size in [5, 4, 3, 2]:
+                    for ngram_size in [4, 3, 2]:
                         if seq_len > ngram_size:
                             target = seq_buffer[0, seq_len-ngram_size:seq_len]
                             search_space = seq_buffer[0, :seq_len-1]
@@ -992,26 +1010,35 @@ class VLMModel:
 
                     
                     if found_candidates > 0:
-                        L = self._K + 1
+                        # Choose the smallest K that fits the candidates
+                        if found_candidates <= 2:
+                            K = 2
+                        elif found_candidates <= 5:
+                            K = 5
+                        else:
+                            K = 9
+                            
+                        L = K + 1
+                        spec = self._model._aicas_specs[K]
                         
                         # Prepare speculative input
-                        self._model._aicas_next_token_spec.zero_()
+                        spec["next_token"].zero_()
                         # self._model._aicas_next_token has the current token
-                        self._model._aicas_next_token_spec[0, 0] = self._model._aicas_next_token[0, 0]
-                        self._model._aicas_next_token_spec[0, 1:found_candidates+1] = candidates
+                        spec["next_token"][0, 0] = self._model._aicas_next_token[0, 0]
+                        spec["next_token"][0, 1:found_candidates+1] = candidates
                         
                         # Cache position
                         curr_pos = self._model._aicas_cache_position.item()
-                        self._model._aicas_cache_position_spec.copy_(self._model._aicas_arange_L + curr_pos)
+                        spec["cache_position"].copy_(spec["arange"] + curr_pos)
                         
                         # Position ids
                         pos_start = self._model._aicas_position_ids[0, 0, 0].item()
-                        self._model._aicas_position_ids_spec.copy_(self._model._aicas_arange_L + pos_start)
+                        spec["position_ids"].copy_(spec["arange"] + pos_start)
                         
-                        self._model._aicas_g_spec.replay()
+                        spec["g"].replay()
                         
                         # Verification
-                        spec_logits = self._model._aicas_decode_out_spec.logits[0, :found_candidates+1].argmax(dim=-1)
+                        spec_logits = spec["decode_out"].logits[0, :found_candidates+1].argmax(dim=-1)
                         # spec_logits[0] is prediction for tok, spec_logits[1] is prediction for c1...
                         
                         accepted = 0
@@ -1044,8 +1071,7 @@ class VLMModel:
                         # Fallback to single token graph
                         self._model._aicas_g.replay()
                         
-                        tok = self._model._aicas_decode_out.logits[0, -1].argmax().unsqueeze(0).unsqueeze(0)
-                        tok_val = tok.item()
+                        tok_val = self._model._aicas_next_token.item()
                         generated_ids.append(tok_val)
                         seq_buffer[0, seq_len] = tok_val
                         seq_len += 1
@@ -1053,10 +1079,6 @@ class VLMModel:
                         
                         if tok_val in eos_token_id and step >= min_new_tokens - 1:
                             break
-                            
-                        self._model._aicas_next_token.copy_(tok)
-                        self._model._aicas_cache_position.add_(1)
-                        self._model._aicas_position_ids.add_(1)
                         
                 output_ids = torch.cat([input_ids, torch.tensor([generated_ids[1:]], device=input_ids.device)], dim=1) if len(generated_ids) > 1 else input_ids
                 return output_ids
